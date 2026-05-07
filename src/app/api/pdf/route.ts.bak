@@ -1,0 +1,176 @@
+import { NextRequest, NextResponse } from 'next/server';
+import { supabaseAdmin } from '@/lib/db/client';
+
+export async function GET(req: NextRequest) {
+  const { searchParams } = new URL(req.url);
+  const caseId = searchParams.get('caseId');
+  const token = searchParams.get('token'); // for portal access
+  const sessionIds = searchParams.get('sessions')?.split(',') || [];
+
+  if (!caseId) {
+    return NextResponse.json({ error: 'caseId required' }, { status: 400 });
+  }
+
+  // Verify auth - either staff session or valid share token
+  let authorised = false;
+  let generatedBy = 'Unknown';
+
+  if (token) {
+    const { data: link } = await supabaseAdmin()
+      .from('share_links')
+      .select('*')
+      .eq('token', token)
+      .eq('status', 'active')
+      .single();
+    authorised = !!link;
+    generatedBy = link?.recipient_name || 'External';
+  } else {
+    // Check staff session via auth header
+    const authHeader = req.headers.get('authorization');
+    if (authHeader) {
+      const { data: { user } } = await supabaseAdmin().auth.getUser(authHeader.replace('Bearer ', ''));
+      if (user) {
+        authorised = true;
+        const { data: staff } = await supabaseAdmin().from('staff').select('full_name').eq('id', user.id).single();
+        generatedBy = staff?.full_name || user.email || 'Staff';
+      }
+    }
+  }
+
+  if (!authorised) {
+    return NextResponse.json({ error: 'Unauthorised' }, { status: 401 });
+  }
+
+  // Fetch case data
+  const db = supabaseAdmin();
+
+  const { data: caseData } = await db.from('cases')
+    .select('*, persons(*), centre:centre_id(name)')
+    .eq('id', caseId).single();
+
+  if (!caseData) return NextResponse.json({ error: 'Case not found' }, { status: 404 });
+
+  // Fetch sessions
+  let sessionQuery = db.from('sessions')
+    .select('*, supervisor:supervisor_id(full_name), session_attendees(person:person_id(full_name))')
+    .eq('case_id', caseId)
+    .order('scheduled_start');
+
+  if (sessionIds.length > 0) {
+    sessionQuery = sessionQuery.in('id', sessionIds);
+  }
+
+  const { data: sessions } = await sessionQuery;
+
+  // Fetch notes for those sessions
+  const sIds = (sessions || []).map((s: Record<string,unknown>) => s.id as string);
+  const { data: notes } = sIds.length
+    ? await db.from('notes').select('*, author:author_id(full_name)').in('session_id', sIds).eq('visible_externally', true).order('created_at')
+    : { data: [] };
+
+  // Build PDF HTML (rendered server-side then returned)
+  const generatedAt = new Date().toLocaleString('en-GB', { dateStyle: 'full', timeStyle: 'short' });
+  const centreName = (caseData.centre as {name:string}|null)?.name || 'SafeSpace';
+
+  const sessionRows = (sessions || []).map((s: Record<string, unknown>) => {
+    const sessionNotes = (notes || []).filter((n: Record<string,unknown>) => n.session_id === s.id);
+    const attendees = ((s.session_attendees as Record<string,unknown>[])||[]).map((a: Record<string,unknown>) => (a.person as {full_name:string}|null)?.full_name || '').join(', ');
+    const supervisorName = (s.supervisor as {full_name:string}|null)?.full_name || '';
+
+    const notesHtml = sessionNotes.map((n: Record<string,unknown>) => `
+      <div style="margin:8px 0;padding:8px 10px;background:#f9f9f9;border-left:3px solid ${n.note_type === 'welfare_concern' ? '#DC2626' : n.note_type === 'incident' ? '#EA580C' : '#2563EB'};font-size:12px">
+        <div style="color:#6b7280;font-size:11px;margin-bottom:4px">${n.note_type?.toString().replace('_',' ')} · ${(n.author as {full_name:string}|null)?.full_name || ''} · ${new Date(n.created_at as string).toLocaleString('en-GB')}</div>
+        <div>${n.body}</div>
+      </div>
+    `).join('');
+
+    return `
+      <div style="margin:16px 0;padding:16px;border:1px solid #e2e8f0;border-radius:6px;page-break-inside:avoid">
+        <div style="display:flex;justify-content:space-between;margin-bottom:10px">
+          <div>
+            <div style="font-weight:600;font-size:14px">${new Date(s.scheduled_start as string).toLocaleDateString('en-GB', { dateStyle: 'full' })}</div>
+            <div style="color:#6b7280;font-size:12px">${new Date(s.scheduled_start as string).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })} — ${new Date(s.scheduled_end as string).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })}</div>
+          </div>
+          <div style="text-align:right;font-size:12px;color:#6b7280">
+            <div>${String(s.session_type || '').replace('_',' ')} session</div>
+            <div>Supervisor: ${supervisorName}</div>
+            <div>Status: ${s.status}</div>
+          </div>
+        </div>
+        <div style="font-size:12px;color:#374151;margin-bottom:8px"><strong>Attendees:</strong> ${attendees || '—'}</div>
+        ${sessionNotes.length > 0 ? `<div style="margin-top:10px"><div style="font-size:11px;font-weight:600;color:#6b7280;text-transform:uppercase;letter-spacing:0.04em;margin-bottom:6px">Session notes</div>${notesHtml}</div>` : ''}
+      </div>
+    `;
+  }).join('');
+
+  const children = (caseData.persons as Record<string,unknown>[])?.filter((p: Record<string,unknown>) => p.role === 'child') || [];
+  const childrenList = children.map((c: Record<string,unknown>) => `${c.full_name}${c.dob ? ` (DOB: ${new Date(c.dob as string).toLocaleDateString('en-GB')})` : ''}`).join(', ');
+
+  const html = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Court Bundle — ${caseData.case_ref}</title>
+  <style>
+    body { font-family: Arial, Helvetica, sans-serif; color: #1a1a2e; margin: 0; padding: 40px; font-size: 13px; }
+    .header { border-bottom: 2px solid #2563EB; padding-bottom: 20px; margin-bottom: 24px; }
+    .header-top { display: flex; justify-content: space-between; align-items: flex-start; }
+    .logo { font-size: 20px; font-weight: 700; color: #2563EB; }
+    .badge { background: #EEF2FF; border: 1px solid #C7D2FE; padding: 3px 8px; border-radius: 4px; font-size: 11px; color: #3730A3; font-weight: 600; }
+    h1 { font-size: 22px; margin: 16px 0 4px; }
+    .meta { color: #6b7280; font-size: 12px; }
+    .section-title { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: #6b7280; margin: 20px 0 10px; border-bottom: 1px solid #e2e8f0; padding-bottom: 6px; }
+    .info-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px; }
+    .info-item label { font-size: 11px; color: #6b7280; display: block; margin-bottom: 2px; }
+    .info-item span { font-size: 13px; color: #1a1a2e; }
+    .warning { background: #FFF5F5; border: 1px solid #FED7D7; border-left: 3px solid #DC2626; padding: 10px 14px; border-radius: 0 6px 6px 0; margin: 12px 0; font-size: 12px; }
+    .footer { margin-top: 40px; padding-top: 16px; border-top: 1px solid #e2e8f0; font-size: 11px; color: #9ca3af; display: flex; justify-content: space-between; }
+    @media print { body { padding: 20px; } }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="header-top">
+      <div class="logo">${centreName}</div>
+      <div>
+        <div class="badge">CONFIDENTIAL</div>
+        <div style="margin-top:4px;font-size:11px;color:#6b7280">Generated: ${generatedAt}</div>
+        <div style="font-size:11px;color:#6b7280">By: ${generatedBy}</div>
+      </div>
+    </div>
+    <h1>Family Contact Centre Records</h1>
+    <div class="meta">Case reference: <strong>${caseData.case_ref}</strong> · ${caseData.family_name} family</div>
+  </div>
+
+  <div class="section-title">Case information</div>
+  <div class="info-grid">
+    <div class="info-item"><label>Case reference</label><span>${caseData.case_ref}</span></div>
+    <div class="info-item"><label>Referral source</label><span>${String(caseData.referral_source||'').replace('_',' ')}</span></div>
+    <div class="info-item"><label>Children</label><span>${childrenList || '—'}</span></div>
+    <div class="info-item"><label>Court order reference</label><span>${caseData.legal_order_ref || '—'}</span></div>
+    <div class="info-item"><label>Social worker</label><span>${caseData.social_worker || '—'}</span></div>
+    <div class="info-item"><label>Cafcass officer</label><span>${caseData.cafcass_officer || '—'}</span></div>
+  </div>
+
+  ${(caseData.risk_flags as string[])?.length ? `
+  <div class="warning">
+    <strong>Risk flags:</strong> ${(caseData.risk_flags as string[]).map((f: string) => f.replace(/_/g,' ')).join(', ')}
+  </div>` : ''}
+
+  <div class="section-title">Session records (${(sessions||[]).length} sessions)</div>
+  ${sessionRows || '<p style="color:#6b7280;font-size:13px">No sessions in the selected range.</p>'}
+
+  <div class="footer">
+    <div>This document was generated by ${centreName} on ${generatedAt}. All session notes are timestamped and immutable.</div>
+    <div>${caseData.case_ref}</div>
+  </div>
+</body>
+</html>`;
+
+  return new NextResponse(html, {
+    headers: {
+      'Content-Type': 'text/html',
+      'Content-Disposition': `attachment; filename="SafeSpace-${caseData.case_ref}-Court-Bundle.html"`,
+    },
+  });
+}

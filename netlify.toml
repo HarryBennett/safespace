@@ -1,0 +1,14 @@
+[build]
+  command = "npm run build"
+  publish = ".next"
+
+[[plugins]]
+  package = "@netlify/plugin-nextjs"
+
+# ── Scheduled functions (invoice chase cron) ──────────────────────────────────
+[functions]
+  directory = "netlify/functions"
+
+[[scheduled-functions]]
+  name    = "invoice-chase"
+  schedule = "0 8 * * *"   # 08:00 UTC daily
