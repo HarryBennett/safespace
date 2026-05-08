@@ -15,5 +15,19 @@ export async function middleware(req: NextRequest) {
     return res;
   }
 
-  const hasSession = req.cookies.getAll().some(c => 
-    c.name.startsWith('sb-') && c.nam
+  const hasSession = req.cookies.getAll().some(c =>
+    c.name.startsWith('sb-') && c.name.endsWith('-auth-token')
+  );
+
+  if (!hasSession) {
+    const loginUrl = new URL('/auth/login', req.url);
+    loginUrl.searchParams.set('next', path);
+    return NextResponse.redirect(loginUrl);
+  }
+
+  return res;
+}
+
+export const config = {
+  matcher: ['/((?!_next/static|_next/image|favicon.ico).*)'],
+};
